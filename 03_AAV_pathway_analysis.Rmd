@@ -1,0 +1,293 @@
+---
+title: "Reactome Pathway Analysis"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(tidyr)
+library(pcaMethods)
+library(ggrepel)
+library(plyr)
+library(dplyr)
+
+source('./specs.R')
+
+```
+
+# gtf
+
+```{r, get custom gtf file}
+
+# ensemblID geneID mouse
+gtf = fread('./Mus_musculus.GRCm38.96_AAV.gtf', header = F, sep = "\t") %>%
+  dplyr::filter(V3 == "gene") %>%
+  mutate(geneID = gsub(".*gene_name .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(geneID = ifelse(substr(geneID, 1, 7) == 'gene_id', NA, geneID)) %>%
+  mutate(ensemblID = gsub(".*gene_id .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(biotype = gsub(".*gene_biotype .(.*?).;", "\\1", V9, perl = T)) %>%
+  dplyr::select(geneID, ensemblID, biotype) %>%
+  data.table
+
+```
+
+# load data
+
+```{r, get data}
+
+# expression data
+df.corrected = data.table::fread('./data/AAV_logCPM_corrected.txt') %>%
+  tibble::column_to_rownames('ensembl_gene_id')
+
+# column data
+df.meta = fread('./data/AAV_meta.txt')
+
+# defined genesets
+df.DE.sets = fread('./results/df.DE_sets.csv')
+
+# genesets to list
+sets = df.DE.sets$geneset %>% unique
+list.DE.sets = lapply(sets, function(x)
+  df.DE.sets[geneset == x, ensemblID]) %>%
+  magrittr::set_names(sets)
+
+```
+
+# Pathway Analysis
+
+## get pathway info
+
+```{r, get msigdb pathways}
+
+# databases to query
+databases = c(
+  "CP:REACTOME"
+  )
+
+# query msigdb v 7.1.1
+library(msigdbr)
+df.term2gene = msigdbr(species = "Mus musculus") %>%
+  dplyr::filter(gs_subcat %in% databases) %>%
+  dplyr::select(setID=gs_name, geneID=gene_symbol) %>%
+  merge(gtf, by='geneID') %>%
+  dplyr::select(setID, ensemblID) %>%
+  data.table
+
+# pathway stats
+df.pw.stats = df.term2gene %>%
+  dplyr::add_count(setID, name = 'n.genes') %>%
+  dplyr::select(setID, n.genes) %>%
+  tidyr::separate(setID, 'database', remove=F) %>%
+  unique
+
+# quick look at pw stats
+ggplot(df.pw.stats) + 
+  aes(x=log10(n.genes), fill=database) +
+  geom_density(alpha=0.3) +
+  geom_vline(xintercept = log10(c(15, 500)), linetype='dashed')
+
+```
+
+## ORA
+
+```{r, over-representation analysis}
+
+# threshold for pathways
+thr.pw = 0.01
+
+# include only sets with size > 15
+sets.include = names(which(lapply(list.DE.sets, length) > 15))
+
+# ORA
+df.ORA = lapply(list.DE.sets[sets.include], function(set.DE)
+  clusterProfiler::enricher(
+    set.DE,
+    TERM2GENE = df.term2gene,
+    universe = rownames(df.corrected),
+    minGSSize = 15,
+    pvalueCutoff = 1.1) %>%
+    .@result %>%
+    dplyr::select(-geneID, -Description) %>%
+    data.table) %>%
+  bind_rows(.id = 'geneset') %>%
+  mutate(significant = p.adjust < thr.pw) %>%
+  tidyr::separate(ID, c('database'), sep='_', remove=F)
+
+# stats out
+df.ORA.stats = df.ORA[(significant)][, c('geneset', 'database')] %>%
+  table() %>%
+  data.table %>%
+  tidyr::separate(geneset, c('type', 'transgene', 'tissue'), remove=F)
+
+```
+
+### Barplot ORA
+
+```{r, barplot ORA}
+
+# barplot number of pathways per group
+ggplot(df.ORA.stats) +
+  aes(x=geneset, y=N, fill=database) +
+  geom_bar(stat='identity', position='stack') +
+  facet_wrap(~type, scale='free_x', nrow=1) +
+  theme(
+    axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title.x = element_blank())
+
+```
+
+### Venn ORA
+
+```{r, venn diagram pathway overlaps}
+
+library(ggvenn)
+
+# df to list
+list.ORA = lapply(sets.include, function(x)
+  df.ORA[database == 'REACTOME'][(significant)][geneset == x, ID]) %>%
+  magrittr::set_names(sets.include)
+
+# venn diagrams
+sets.show = list()
+sets.show$Retina = c('set_VEGF_Retina', 'set_TNFa_Retina', 'set_IL6_Retina')
+sets.show$RPE = c('set_VEGF_RPE', 'set_TNFa_RPE', 'set_IL6_RPE')
+sets.show$IL6 = c('set_IL6_Retina', 'set_IL6_RPE')
+sets.show$TNFa = c('set_TNFa_Retina', 'set_TNFa_RPE')
+tmp = 'TNFa'
+list.ORA[sets.show[[tmp]]] %>%
+  magrittr::set_names(sets.show[[tmp]]) %>%
+  magrittr::set_names(gsub('set_', '', names(.))) %>%
+  magrittr::set_names(gsub('_', ' ', names(.))) %>%
+  magrittr::set_names(gsub('RPE', 'Eye cup', names(.))) %>%
+  ggvenn(
+  fill_color = as.character(list.treatment_colors[5:6]),
+  stroke_size = 0.2, 
+  set_name_size = 2.0, 
+  show_percentage = F,
+  text_size = 2.5) +
+  theme(
+    text = element_text(size = 1),
+    plot.margin = margin(20, 0, 20, 0)
+  ) +
+  coord_cartesian(clip = "off")
+
+# save
+ggsave(file = paste0('./plots/venn.ORA_', tmp ,'.pdf'),
+       height=40, width=40, units='mm')
+
+
+Reduce(intersect, list.ORA[sets.show]) %>%
+  gsub('REACTOME_', '', .) %>%
+  gsub('_', ' ', .) %>% 
+  stringr::str_to_title() %>%
+  cat(sep=', ')
+
+```
+
+# visualization
+
+## distance matrix
+
+```{r, choose which pathways to show}
+
+# specs
+sets.show = c('set_VEGF_Retina', 'set_VEGF_Retina', 'set_VEGF_Retina')
+sets.show = c('set_VEGF_RPE', 'set_TNFa_RPE', 'set_IL6_RPE')
+db = c('REACTOME')
+
+# harmonize enrichment results and choose which method
+df.pw = df.ORA %>%
+  dplyr::select(contrast=geneset, ID, database, fdr=p.adjust, significant) %>%
+  dplyr::filter(contrast %like% 'set_')
+
+# list of pathways to plot and levels for plotting
+list.pw.plot = df.pw %>%
+  dplyr::filter(database %in% db) %>%
+  dplyr::filter(contrast %in% sets.show) %>%
+  dplyr::filter(significant == T) %>%
+  mutate(contrast = factor(contrast, levels = sets.show)) %>%
+  mutate(contrast.num = as.numeric(contrast)) %>%
+  dplyr::group_by(ID) %>%
+  dplyr::summarise(g = sum(contrast.num)) %>%
+  data.table %>%
+  arrange(g) %>%
+  .$ID
+
+```
+
+## barplot
+
+```{r, enrichment barplot}
+
+library(patchwork)
+
+# tiles with significance
+p1 = df.pw %>%
+  dplyr::filter(ID %in% list.pw.plot) %>%
+  dplyr::filter(contrast %in% sets.show) %>%
+  dplyr::filter(significant == T) %>%
+  mutate(ID = factor(ID, levels = list.pw.plot)) %>%
+  mutate(contrast = factor(contrast, levels=(sets.show))) %>%
+ggplot() +
+  aes(x=contrast, y=ID, fill=contrast) +
+  geom_tile() +
+  scale_fill_manual(values = as.character(list.treatment_colors[4:6]), drop=F) +
+  scale_y_discrete(label = function(x)
+    gsub('REACTOME', '', gsub('_', ' ', stringr::str_trunc(x, 50)))) +
+  theme(
+    text = element_text(size=7),
+    axis.title = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=0.5),
+    legend.position = 'none')
+
+# enrichment barplot
+p2 = df.pw %>%
+  dplyr::filter(ID %in% list.pw.plot) %>%
+  dplyr::filter(contrast %in% sets.show) %>%
+  mutate(ID = factor(ID, levels = list.pw.plot)) %>%
+  mutate(contrast = factor(contrast, levels=(sets.show))) %>%
+ggplot() +
+  aes(x=-log10(fdr), y=ID, fill=contrast) +
+  geom_bar(stat='identity', position=position_dodge(preserve = "single")) +
+  geom_vline(xintercept = -log10(thr.pw), linetype='dashed') +
+  scale_fill_manual(
+    values = as.character(list.treatment_colors[5:6], drop=F),
+    labels = gsub('RPE', 'Eye cup', gsub('_', ' ', gsub('set_', '', sets.show[2:3]))),
+    name='') +
+  coord_cartesian(xlim=c(1.5,35)) +
+  labs(x = 'BH-adjusted P-Value [-log10]') +
+  theme(
+    text = element_text(size=7),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    legend.key.size=unit(0.5,"line"),
+    legend.position = 'top')
+
+# assemble and save
+p.full = p1 + p2 + plot_layout(widths = c(0.1, 1))
+ggsave(p.full, file = './plots/barplot.pws.rpe.pdf',
+       width=150, height=250, units='mm')
+
+```
+
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

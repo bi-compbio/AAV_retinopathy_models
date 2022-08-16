@@ -1,0 +1,241 @@
+---
+title: "Comparison AAV and OIR experiments"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(tidyr)
+library(pcaMethods)
+library(limma)
+library(ggrepel)
+library(plyr)
+library(dplyr)
+
+source('./specs.R')
+
+```
+
+# gtf
+
+```{r, get custom gtf file}
+
+# ensemblID geneID mouse
+gtf = fread('./data/Mus_musculus.GRCm38.96_AAV.gtf', header = F, sep = "\t") %>%
+  dplyr::filter(V3 == "gene") %>%
+  mutate(geneID = gsub(".*gene_name .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(geneID = ifelse(substr(geneID, 1, 7) == 'gene_id', NA, geneID)) %>%
+  mutate(ensemblID = gsub(".*gene_id .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(biotype = gsub(".*gene_biotype .(.*?).;", "\\1", V9, perl = T)) %>%
+  dplyr::select(geneID, ensemblID, biotype) %>%
+  data.table
+
+```
+
+# load DE results AAV models
+
+```{r, get data}
+
+# limma results
+df.AAV_DE = fread('./results/df.AAV_limma.csv')
+df.OIR_DE = fread('./results/df.OIR_limma.csv')
+
+# defined genesets
+#df.DE.sets = fread('./results/proj1073_DEsets.csv')
+
+# genesets to list
+sets = df.DE.sets$geneset %>% unique
+list.DE.sets = lapply(sets, function(x)
+  df.DE.sets[geneset == x, ensemblID]) %>%
+  magrittr::set_names(sets)
+
+# AAV sets to list
+list.AAV_sets = c('IL6', 'TNFa', 'VEGF')
+list.AAV_DE = lapply(list.AAV_sets, function(x)
+  df.AAV_DE[tissue == 'Retina'][contrast == x][(sig)]$ensemblID) %>%
+  magrittr::set_names(c('AAV IL6', 'AAV TNFa', 'AAV VEGF'))
+
+# OIR sets to list
+list.OIR_sets = paste0('P', 12:16)
+list.OIR_DE = lapply(list.OIR_sets, function(x)
+  df.OIR_DE[contrast == x][(sig)]$ensemblID) %>%
+  magrittr::set_names(paste0('OIR P', 12:16))
+
+
+```
+
+# Venn diagram DE genes
+
+```{r, venn diagram}
+
+c(list.AAV_DE, list.OIR_DE['OIR P16']) %>%
+  ggvenn(
+    fill_alpha = 0.2,
+    stroke_size = 0.2, 
+    set_name_size = 2.5, 
+    show_percentage = F,
+    text_size = 2.5) +
+  scale_x_continuous(expand = c(.1, .1)) +
+  theme(
+    text = element_text(size = 7),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  )
+
+ggsave('./plots/venn.AAV.vs.OIR.pdf',
+       width=60, height=50, units='mm')
+
+```
+
+# Correlation of fold-changes
+
+```{r, fold-changes and significance}
+
+# common genes
+genes.common = intersect(df.AAV_DE$ensemblID, df.OIR_DE$ensemblID)
+
+# limma results for common genes
+df.common = df.OIR_DE %>%
+  dplyr::filter(ensemblID %in% genes.common) %>%
+  dplyr::select(group=contrast, ensemblID, logFC, sig) %>%
+  bind_rows(
+    df.AAV_DE %>%
+      #dplyr::filter(group %in% groups2) %>%
+      dplyr::filter(ensemblID %in% genes.common) %>%
+      dplyr::select(group, ensemblID, logFC, sig)) %>%
+  merge(gtf, by='ensemblID', all.x=T)
+
+df.FC = df.common %>%
+  dplyr::select(ensemblID, group, logFC) %>%
+  tidyr::spread(group, logFC) %>%
+  data.frame %>% 
+  tibble::column_to_rownames('ensemblID')
+
+```
+
+```{r, correlation of fold-changes}
+
+df.cor = df.FC %>% 
+    cor
+
+subset = c(
+  c('IL6_Retina', 'TNFa_Retina', 'VEGF_Retina'),
+  gsub('OIR ', '', names(list.OIR_DE)))
+
+pheatmap::pheatmap(
+  df.cor[subset, subset],
+  cluster_rows = F,
+  cluster_cols = F,
+  display_numbers = T,
+  fontsize = 7,
+  #filename = './plots/heatmap.AAV_OIR_correlation.pdf',
+  width = 70 / 25.4,
+  height = 35 / 25.4
+)
+
+```
+
+# Pathway anlaysis
+
+## Get pathway data
+
+```{r, gat pathway data}
+
+# databases to query
+databases = c(
+  "CP:REACTOME")
+
+# query msigdb
+library(msigdbr)
+df.term2gene = msigdbr(species = "Mus musculus") %>%
+  dplyr::filter(gs_subcat %in% databases) %>%
+  dplyr::select(setID=gs_name, geneID=gene_symbol) %>%
+  merge(gtf, by='geneID') %>%
+  dplyr::select(setID, ensemblID) %>%
+  data.table
+
+```
+
+## Over-representation analysis
+
+```{r, enricher}
+
+# threshold for pathways
+thr.pw = 0.01
+
+# ORA
+sets.tmp = c(list.OIR_DE['OIR P16'], list.AAV_DE['AAV VEGF'])
+df.ORA.tmp = lapply(sets.tmp, function(set.DE)
+  clusterProfiler::enricher(
+    set.DE,
+    TERM2GENE = df.term2gene,
+    universe = genes.common,
+    minGSSize = 15,
+    pvalueCutoff = 1.1) %>%
+    .@result %>%
+    dplyr::select(-geneID, -Description) %>%
+    data.table) %>%
+  bind_rows(.id = 'geneset') %>%
+  mutate(significant = p.adjust < thr.pw) %>%
+  tidyr::separate(ID, c('database'), sep='_', remove=F)
+
+```
+## Barplot
+
+```{r, enricher specific for VEGF OIR P16}
+
+
+pws = df.ORA.tmp %>%
+  dplyr::filter(significant == T) %>%
+  .$ID %>%
+  unique
+
+levels.pw = df.ORA.tmp %>%
+  dplyr::filter(geneset %in% c('AAV VEGF')) %>%
+  dplyr::filter(ID %in% pws) %>%
+  arrange(p.adjust) %>%
+  .$ID
+
+df.ORA.tmp %>%
+  dplyr::filter(ID %in% pws) %>%
+  mutate(ID = factor(ID, levels = levels.pw)) %>%
+  mutate(geneset = gsub('P16', 'OIR P16', geneset)) %>%
+  mutate(geneset = gsub('set_VEGF_Retina', 'AAV VEGF', geneset)) %>%
+ggplot() +
+  aes(fill=geneset, y=ID, x=-log10(p.adjust)) +
+  geom_vline(xintercept = -log10(thr.pw), linetype='dashed') +
+  geom_bar(stat='identity', position='dodge') +
+  scale_y_discrete(label = function(x) 
+    gsub('_', ' ', gsub('REACTOME_', ' ', stringr::str_trunc(x, 50)))) +
+  labs(x='BH-adjusted P-Value [-log10]') +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1),
+    legend.title = element_blank(),
+    text=element_text(size=7),
+    legend.key.size=unit(0.5,"line"))
+
+ggsave('./plots/barplot.pws.P16_VEGF.pdf',
+       width=110, height=130, units='mm')
+
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

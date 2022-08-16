@@ -1,0 +1,287 @@
+---
+title: "Fold-change visualization"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(tidyr)
+library(pcaMethods)
+library(limma)
+library(ggrepel)
+library(plyr)
+library(dplyr)
+
+source('./specs.R')
+
+```
+
+
+```{r, get custom gtf file}
+
+# ensemblID geneID mouse
+gtf = fread('./data/Mus_musculus.GRCm38.96_AAV.gtf', header = F, sep = "\t") %>%
+  dplyr::filter(V3 == "gene") %>%
+  mutate(geneID = gsub(".*gene_name .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(geneID = ifelse(substr(geneID, 1, 7) == 'gene_id', NA, geneID)) %>%
+  mutate(ensemblID = gsub(".*gene_id .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(biotype = gsub(".*gene_biotype .(.*?).;", "\\1", V9, perl = T)) %>%
+  dplyr::select(geneID, ensemblID, biotype) %>%
+  data.table
+
+```
+
+## load and combine limma tables
+
+```{r, DE results}
+
+# AAV limma table
+df.DE.aav = fread('./results/df.AAV_limma.csv') %>%
+  dplyr::select(-contrast, -label, -geneID, -biotype) %>%
+  dplyr::rename(contrast = group)
+
+# OIR limma
+df.DE.oir = fread('./results/df.OIR_limma.csv') %>%
+  dplyr::select(-geneID, -biotype) %>%
+  mutate(tissue = 'Retina')
+
+# combine
+df.DE.combined = bind_rows(
+  df.DE.aav,
+  df.DE.oir) %>%
+  merge(gtf, by='ensemblID', all.x=T)
+
+# fold-changes in wide format
+df.FC = df.DE.combined %>%
+  dplyr::select(ensemblID, contrast, logFC) %>%
+  tidyr::spread(contrast, logFC) %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+  
+```
+
+# load genesets
+
+```{r, genesets}
+
+# cell specific genes
+df.celltypes = fread('./data/df.scRNA_cell_specific_markers.csv') %>%
+  dplyr::rename(setID = set)
+  
+# pathways reactome
+databases = c(
+  "CP:REACTOME"
+  )
+
+# query msigdb v 7.1.1
+library(msigdbr)
+df.term2gene = msigdbr(species = "Mus musculus") %>%
+  dplyr::filter(gs_subcat %in% databases) %>%
+  dplyr::select(setID=gs_name, geneID=gene_symbol) %>%
+  merge(gtf, by='geneID') %>%
+  dplyr::select(setID, ensemblID) %>%
+  data.table
+
+# custom sets
+df.custom = data.table(
+  setID = 'P16_VEGF',
+  ensemblID = intersect(
+    df.DE.combined[contrast == 'VEGF_Retina'][(sig)]$ensemblID,
+    df.DE.combined[contrast == 'P16'][(sig)]$ensemblID)
+  )
+
+df.genesets = bind_rows(
+  df.celltypes, df.term2gene, df.custom)
+
+```
+
+# heatmap
+
+```{r, fold-change heatmap}
+
+## geneset to show
+set.show = c('VoigtRetina_Endothelial_Cells')
+set.show = c('REACTOME_SIGNALING_BY_VEGF')
+set.show = c('REACTOME_COMPLEMENT_CASCADE')
+set.show = c('HengRetina_Vascular endothelial cells')
+set.show = c('HengRetina_T cells')
+set.show = c('REACTOME_INTEGRIN_CELL_SURFACE_INTERACTIONS')
+set.show = c('P16_VEGF')
+
+#set.show = c('HengRetina_Vascular endothelial cells')
+#set.show = c('HengRetina_T cells')
+
+## contrast to show
+contrasts.show = c('VEGF_Retina', 'TNFa_Retina', 'IL6_Retina')
+contrasts.show = c('VEGF_Retina', 'VEGF_RPE',
+                   'TNFa_Retina', 'TNFa_RPE',
+                   'IL6_Retina', 'IL6_RPE')
+contrasts.show = c('VEGF_Retina', paste0('P', 12:16))
+
+# genes
+genes.show = df.genesets %>%
+  dplyr::filter(setID == set.show) %>%
+  dplyr::filter(
+    ensemblID %in% df.DE.combined[contrast %in% contrasts.show][(sig)]$ensemblID) %>%
+  .$ensemblID %>%
+  unique
+
+# annotation for heatmap
+df.anno = df.DE.combined %>%
+  dplyr::filter(contrast %in% contrasts.show) %>%
+  dplyr::filter(ensemblID %in% genes.show) %>%
+  dplyr::select(geneID, contrast, sig) %>%
+  mutate(sig = ifelse(sig, 't', 'f')) %>%
+  tidyr::spread(contrast, sig) %>%
+  tibble::column_to_rownames('geneID')
+
+# anno colors
+ann_colors = lapply(colnames(df.anno), function(x) 
+  c(t='#FFFFFF', f='#000000')) %>%
+  magrittr::set_names(colnames(df.anno)) %>%
+  magrittr::set_names(gsub('_', ' ', names(.)))
+
+# anno colors 
+ann_colors = list(
+  VEGF_Retina=c(f='#FFFFFF', t=list.treatment_colors[[4]]),
+  VEGF_RPE=c(f='#FFFFFF', t=list.treatment_colors[[4]]),
+  TNFa_Retina=c(f='#FFFFFF', t=list.treatment_colors[[5]]),
+  TNFa_RPE=c(f='#FFFFFF', t=list.treatment_colors[[5]]),
+  IL6_Retina=c(f='#FFFFFF', t=list.treatment_colors[[6]]),
+  IL6_RPE=c(f='#FFFFFF', t=list.treatment_colors[[6]])) %>%
+  magrittr::set_names(gsub('_', ' ', names(.))) %>%
+  magrittr::set_names(gsub('RPE', 'Eye cup', names(.)))
+
+# heatmap colors
+my.breaks <- seq(-3, 3, by=0.1) 
+my.colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name =
+  "RdBu")))(length(my.breaks))
+
+pheatmap::pheatmap(
+  df.FC[genes.show, contrasts.show] %>%
+    magrittr::set_rownames(gtf[match(genes.show, ensemblID), geneID]) %>%
+    magrittr::set_colnames(gsub('_', ' ', colnames(.))) %>%
+    magrittr::set_colnames(gsub('RPE', 'Eye cup', colnames(.))),
+  show_rownames = T,
+  annotation_row = df.anno[, rev(contrasts.show)] %>%
+    magrittr::set_colnames(gsub('_', ' ', colnames(.))) %>%
+    magrittr::set_colnames(gsub('RPE', 'Eye cup', colnames(.))),
+  cluster_cols = F, 
+  annotation_legend = FALSE,
+  annotation_colors = ann_colors,
+  color=my.colors,
+  breaks=my.breaks,
+  treeheight_row = 15,
+  treeheight_col = 10,
+  fontsize = 7,
+  main = gsub('_', ' ', set.show),
+  #filename = paste0('./plots/heatmap.', set.show,'.pdf'),
+  width = 90 / 25.4,
+  height = 140 / 25.4)
+
+# HengRetina_T cells w:50, h:100
+# Complement... w:90, h:110
+# Integrin... w:90, h:140
+
+```
+
+# scatter plot
+
+```{r, scatter}
+
+# conditions to compare
+x = 'VEGF_Retina'
+y = 'P16'
+
+# genes
+genes.show = df.genesets %>%
+  dplyr::filter(setID == set.show) %>%
+  dplyr::filter(
+    ensemblID %in% df.DE.combined[contrast %in% c(x, y)]$ensemblID) %>%
+  .$ensemblID %>%
+  unique
+
+# levels
+levels.sig = c(
+  'None',
+  setdiff(c(x, y), c('None', 'Both')),
+  'Both')
+
+# top genes to label
+n = 15
+top.x = df.DE.combined %>%
+  dplyr::filter(contrast %in% x) %>%
+  dplyr::filter(ensemblID %in% genes.show) %>%
+  dplyr::arrange(-abs(logFC)) %>%
+  mutate(rank = 1:nrow(.)) %>%
+  dplyr::filter(rank <= n) %>%
+  .$ensemblID
+top.y = df.DE.combined %>%
+  dplyr::filter(contrast %in% y) %>%
+  dplyr::filter(ensemblID %in% genes.show) %>%
+  dplyr::arrange(-abs(logFC)) %>%
+  mutate(rank = 1:nrow(.)) %>%
+  dplyr::filter(rank <= n) %>%
+  .$ensemblID
+
+# 
+df.sig = df.DE.combined %>%
+  dplyr::filter(contrast %in% c(x, y)) %>%
+  dplyr::filter(ensemblID %in% genes.show) %>%
+  dplyr::filter(sig == T) %>%
+  dplyr::add_count(ensemblID) %>%
+  mutate(g = ifelse(n == 2, 'Both', contrast)) %>%
+  dplyr::select(ensemblID, g) %>%
+  unique
+
+# prep df for plotting
+df.scatter = df.DE.combined %>%
+  dplyr::filter(contrast %in% c(x, y)) %>%
+  dplyr::filter(ensemblID %in% genes.show) %>%
+  dplyr::select(ensemblID, contrast, geneID, logFC) %>%
+  tidyr::spread(contrast, logFC) %>%
+  # info on significance
+  merge(df.sig, by='ensemblID', all=T) %>%
+  mutate(g = ifelse(is.na(g), 'None', g)) %>%
+  mutate(g = factor(g, levels=levels.sig)) %>%
+  # which labels to plot
+  mutate(show = ensemblID %in% c(top.x, top.y))
+  #mutate(show = ifelse(g == 'Both', TRUE, show))
+
+# scatter plot
+ggplot(df.scatter) +
+  aes_string(x=x, y=y, color='g') +
+  geom_point(size=0.5) +
+  geom_text_repel(data = df.scatter[(show)],
+    aes(label = geneID), color='black', size=2.5) +
+  #scale_color_manual(
+  #  labels = gsub('_', ' ', levels.sig),
+  #  values = c('gray', brewer.pal(3, 'Set2'))) +
+  ggtitle(gsub('REACTOME', '', gsub('_', ' ', set.show))) +
+  labs(
+    x = paste0(gsub('_', ' ', x), ' [log2 FC]'), 
+    y = paste0(gsub('_', ' ', y), ' [log2 FC]')) +
+  guides(color=guide_legend(title='Significance')) +
+  theme(
+    #text = element_text(size=7),    
+    legend.key.size=unit(0.5,"line"))
+
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

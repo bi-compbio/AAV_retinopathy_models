@@ -1,0 +1,310 @@
+---
+title: "OIR QC, differential expression, pw analysis"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(tidyr)
+library(pcaMethods)
+library(limma)
+library(ggrepel)
+library(plyr)
+library(dplyr)
+
+source('./specs.R')
+
+```
+
+# gtf
+
+```{r, get custom gtf file}
+
+# ensemblID geneID mouse
+gtf = fread('./data/Mus_musculus.GRCm38.96_AAV.gtf', header = F, sep = "\t") %>%
+  dplyr::filter(V3 == "gene") %>%
+  mutate(geneID = gsub(".*gene_name .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(geneID = ifelse(substr(geneID, 1, 7) == 'gene_id', NA, geneID)) %>%
+  mutate(ensemblID = gsub(".*gene_id .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(biotype = gsub(".*gene_biotype .(.*?).;", "\\1", V9, perl = T)) %>%
+  dplyr::select(geneID, ensemblID, biotype) %>%
+  data.table
+
+```
+# Get and subset mouse OIR data
+
+```{r, OIR mouse expression data}
+
+# expression data
+df.OIR_counts = data.table::fread('./data/OIR_counts.txt') %>%
+  tibble::column_to_rownames('ensembl_gene_id')
+
+# column data
+df.meta = fread('./data/OIR_meta.txt')
+
+# threshold
+thr.counts = 10
+
+# density plot
+ggplot(
+  df.OIR_counts %>% data.table %>% tidyr::gather()) +
+  aes(x=log10(value), fill=key) +
+  geom_density(alpha=0.1) +
+  geom_vline(xintercept = log10(thr.counts), linetype='dashed') +
+  theme(legend.position = 'none')
+
+# filter
+df.OIR_counts.filtered = df.OIR_counts[apply(df.OIR_counts, 1, max) >= thr.counts, ]
+
+```
+
+# Differential expression
+
+```{r, voom normalization and DE}
+
+# voom normalization
+df.OIR_voom = df.OIR_counts.filtered %>%
+  edgeR::DGEList() %>%
+  edgeR::calcNormFactors() %>%
+  voom()
+
+df.tmp = df.meta %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleName')
+
+# design
+design = model.matrix(
+  ~0 + MFGroup, 
+  data = df.tmp) %>%
+  magrittr::set_colnames(gsub('MFGroup', '', colnames(.)))
+
+# contrasts
+contr.matrix = makeContrasts(
+  P12 = Retina___Postnatal_Hyperoxic_d12 - Retina___Postnatal_Control_d12,
+  P13 = Retina___Postnatal_Hyperoxic_d13 - Retina___Postnatal_Control_d13,
+  P14 = Retina___Postnatal_Hyperoxic_d14 - Retina___Postnatal_Control_d14,
+  P15 = Retina___Postnatal_Hyperoxic_d15 - Retina___Postnatal_Control_d15,
+  P16 = Retina___Postnatal_Hyperoxic_d16 - Retina___Postnatal_Control_d16,
+  levels = colnames(design))
+
+# limma
+res.limma = df.OIR_voom[, rownames(design)] %>%
+  lmFit(design=design) %>%
+  contrasts.fit(contrasts=contr.matrix) %>%
+  eBayes()
+df.DE_OIR = lapply(1:ncol(contr.matrix), function(index.contrast)
+    topTreat(res.limma, coef = index.contrast, n = Inf, adjust.method = 'BH') %>%
+      tibble::rownames_to_column('ensemblID') %>%
+      mutate(rank = 1:nrow(.)) %>%
+      mutate(contrast = colnames(contr.matrix)[index.contrast])) %>%
+    bind_rows() %>%
+  mutate('sig' = adj.P.Val < 0.05) %>%
+  merge(gtf, by='ensemblID') %>%
+  data.table 
+
+fwrite(df.DE_OIR, './results/df.OIR_limma.csv')
+
+```
+
+```{r, barplot DE genes}
+
+# barplot DE gene OIR
+df.DE_OIR %>%
+  dplyr::filter(adj.P.Val < 0.05) %>%
+  dplyr::count(contrast) %>%
+ggplot() +
+  aes(x=contrast, y=n, fill=contrast) +
+  geom_bar(stat='identity') +
+  geom_text(aes(x=contrast, y=1250, label=n), angle=90, size=2.5) +
+  labs(y='# DE genes') +
+  theme(
+    text = element_text(size=7),
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1),
+    axis.title.x = element_blank(),
+    legend.position = 'none'
+  )
+
+# save
+ggsave('./plots/barplot.oir_DEgenes.pdf',
+       width=40, height=50, units='mm')
+
+```
+
+# Expression plots
+
+```{r, expression plots}
+
+# combined data table
+df.OIR_plot = df.OIR_voom$E %>%
+  t %>%
+  data.frame %>%
+  tibble::rownames_to_column('sampleName') %>%
+  merge(df.meta, by='sampleName')
+
+# plot title
+gene.ensemblID = 'ENSMUSG00000028635'
+gene.geneID = gtf[ensemblID == gene.ensemblID, geneID]
+plot.title = paste0(gene.geneID, ' (', gene.ensemblID, ')')
+
+# plot
+ggplot(df.OIR_plot) +
+  aes_string(x='Timepoint', y=gene.ensemblID, fill='Treatment') +
+  geom_boxplot(outlier.shape=17, outlier.size=0.75, outlier.color='black') +
+  geom_jitter(width=0.0, height=0, size=0.25) +
+  geom_point(size=0.25, position = position_jitterdodge(jitter.width=0.1)) +
+  ggtitle(plot.title) +
+  ylab('CPM [log2]') +
+  theme(
+    axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title.x = element_blank(),
+    text = element_text(size = 7),
+    plot.title = element_text(size=7),
+    legend.key.size=unit(0.5,"line")
+  )
+
+# save
+ggsave(file = paste0('./plots/cpm.OIR.', gene.geneID, '.pdf'),
+       width=85, height=65, units = 'mm')
+
+
+```
+
+# PCA
+
+```{r, PCA}
+
+# calculate scores
+n.pc = 10
+df.scores = pca(
+  object = t(df.OIR_voom$E),
+  scale  = "uv",  
+  nPcs   = n.pc) %>%
+  scores %>%
+  data.frame %>%
+  tibble::rownames_to_column('sampleName') %>%
+  merge(df.meta, by='sampleName') %>%
+  data.table
+
+# PCA plot
+df.scores %>%
+  mutate(Treatment = 
+    factor(Treatment, levels = c('Normoxia 21pc', 'Hyperoxia 75pc'))) %>%
+ggplot() +
+  aes(x=PC1, y=PC2, color=Timepoint, shape=Treatment) +
+  geom_point() +
+  theme(
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line")
+  )
+
+# save
+ggsave('./plots/pca.oir.pdf',
+       width=110, height=70, units='mm')
+
+```
+
+# Pathway analysis
+
+## Get pathway data
+
+```{r, gat pathway data}
+
+# databases to query
+databases = c(
+  "CP:REACTOME")
+
+# query msigdb
+library(msigdbr)
+df.term2gene = msigdbr(species = "Mus musculus") %>%
+  dplyr::filter(gs_subcat %in% databases) %>%
+  dplyr::select(setID=gs_name, geneID=gene_symbol) %>%
+  merge(gtf, by='geneID') %>%
+  dplyr::select(setID, ensemblID) %>%
+  data.table
+
+```
+
+## over-representation analysis
+
+```{r, ORA}
+
+# DE genes to list
+list.oir = paste0('P', 12:16)
+list.DE.oir = lapply(list.oir, function(x)
+  df.DE_OIR[(sig)][contrast == x, ensemblID]) %>%
+  magrittr::set_names(list.oir)
+
+
+# threshold for pathways
+thr.pw = 0.01
+
+# ORA
+df.ORA.OIR = lapply(list.DE.oir, function(set.DE)
+  clusterProfiler::enricher(
+    set.DE,
+    TERM2GENE = df.term2gene,
+    universe = rownames(df.OIR_voom$E),
+    minGSSize = 15,
+    pvalueCutoff = 1.1) %>%
+    .@result %>%
+    dplyr::select(-geneID, -Description) %>%
+    data.table) %>%
+  bind_rows(.id = 'geneset') %>%
+  mutate(significant = p.adjust < thr.pw) %>%
+  tidyr::separate(ID, c('database'), sep='_', remove=F)
+
+# save
+fwrite(df.ORA.OIR, './results/df.OIR_ORA.csv')
+
+```
+
+```{r, barplot OIR pathways}
+
+# pathways to show
+pws.oir = df.ORA.OIR[(significant)]$ID %>% unique
+
+# ordering
+lvls.oir = df.ORA.OIR %>%
+  dplyr::filter(ID %in% pws.oir) %>%
+  dplyr::filter(geneset == 'P16') %>%
+  arrange(p.adjust) %>%
+  .$ID
+
+# barplot
+df.ORA.OIR %>%
+  dplyr::filter(ID %in% pws.oir) %>%
+  mutate(ID = factor(ID, levels = lvls.oir)) %>%
+ggplot() +
+  aes(x=-log10(p.adjust), y=ID, fill=geneset) +
+  geom_bar(stat='identity', position='dodge') +
+  geom_vline(xintercept = -log10(thr.pw), linetype='dashed') +
+  scale_y_discrete(label = function(x) 
+    gsub('_', ' ', gsub('REACTOME_', ' ', stringr::str_trunc(x, 50)))) +
+  labs(fill='Timepoint') +
+  theme(
+    axis.title.y = element_blank(),
+    text=element_text(size=7),
+    legend.key.size=unit(0.5,"line"))
+
+ggsave('./plots/barplot.oir_reactome.pdf',
+       width=110, height=130, units='mm')
+
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

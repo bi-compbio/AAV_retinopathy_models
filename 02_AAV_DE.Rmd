@@ -1,0 +1,665 @@
+---
+title: "Differential Expression AAV data"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(tidyr)
+library(pcaMethods)
+library(limma)
+library(ggrepel)
+library(plyr)
+library(dplyr)
+library(patchwork)
+
+# seetings for plots
+source('./specs.R')
+
+```
+
+# gtf
+
+```{r, get custom gtf file}
+
+# ensemblID geneID mouse
+gtf = fread('./Mus_musculus.GRCm38.96_AAV.gtf', header = F, sep = "\t") %>%
+  dplyr::filter(V3 == "gene") %>%
+  mutate(geneID = gsub(".*gene_name .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(geneID = ifelse(substr(geneID, 1, 7) == 'gene_id', NA, geneID)) %>%
+  mutate(ensemblID = gsub(".*gene_id .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(biotype = gsub(".*gene_biotype .(.*?).;", "\\1", V9, perl = T)) %>%
+  dplyr::select(geneID, ensemblID, biotype) %>%
+  data.table
+
+```
+
+# load project data
+
+```{r, get data}
+
+# counts data
+df.corrected = data.table::fread('./data/AAV_logCPM_corrected.txt') %>%
+  tibble::column_to_rownames('ensembl_gene_id')
+
+# column data
+df.meta = fread('./data/AAV_meta.txt')
+
+```
+
+
+# expression plots after correction
+
+```{r, df for plots after correction}
+
+# set up values
+df.plot.corrected = t(df.corrected) %>%
+  data.frame %>%
+  tibble::rownames_to_column('sampleId') %>%
+  merge(df.meta, by='sampleId') %>%
+  mutate(treatment = 
+    factor(treatment, levels = names(list.treatment_colors))) %>%
+  #dplyr::filter(!exclude_vegf) %>%
+  data.table
+
+```
+
+```{r, plot expression of individual genes}
+
+# treatment labels
+list.treatment_labels = c(
+  "Non-injected",
+  "AAV-stuffer (low)",
+  "AAV-stuffer (high)",
+  "AAV-VEGF (low)",
+  "AAV-TNFa (high)",
+  "AAV-IL6 (high)")
+
+list.treatment_show = c(
+  'none', 
+  'AAVstuffer_low',
+  'AAVstuffer_high',
+  'AAVvegf_low',
+  'AAVtnfa_high',
+  'AAVil6_high')
+
+# genes of interest 
+goi = c('hVEGF', 'hIL6', 'hTNFa', 'Vegfa', 'Tnf', 'Il6')
+ccl2 = 'ENSMUSG00000035385'
+c3 = 'ENSMUSG00000024164'
+madcam1 = 'ENSMUSG00000020310'
+
+# plot title
+gene.ensemblID = 'ENSMUSG00000025746'
+gene.geneID = gtf[ensemblID == gene.ensemblID, geneID]
+plot.title = paste0(gene.geneID, ' (', gene.ensemblID, ')')
+#plot.title = gene.geneID
+
+# plot
+ggplot(df.plot.corrected %>%
+         dplyr::filter(treatment %in% list.treatment_show) %>%
+         mutate(treatment = factor(treatment, levels=list.treatment_show)) %>%
+         mutate(tissue = gsub('RPE', 'Eye cup', tissue)) %>%
+         mutate(tissue = factor(tissue, levels = c('Retina', 'Eye cup')))) +
+  aes_string(x='treatment', y=gene.ensemblID, color='treatment') +
+  geom_boxplot(outlier.shape=17, outlier.size=0.75, outlier.color='black') +
+  geom_jitter(width=0.1, height=0, size=0.25) +
+  #facet_wrap(~tissue, scale='free_y') +
+  facet_wrap(~tissue) +
+  ggtitle(plot.title) +
+  ylab('CPM [log2]') +
+  scale_color_manual(values = as.character(list.treatment_colors)) +
+  scale_x_discrete(labels = list.treatment_labels) +
+  theme(
+    legend.position = 'none',
+    axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title.x = element_blank(),
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line"),
+    plot.title = element_text(size=7)
+  )
+
+
+ggsave(file = paste0('./plots/cpm.', gene.geneID, '.pdf'),
+       width=60, height=65, units = 'mm')
+
+```
+
+# PCA plots corrected data
+
+```{r, pca}
+
+# split data by tissue
+list.samples = list()
+list.samples[['All samples']] = df.meta$sampleId
+list.samples[['Retina']] = df.meta[tissue == 'Retina']$sampleId
+list.samples[['Eye cup']] = df.meta[tissue != 'Retina']$sampleId
+
+# PCA per subset
+n.features = 1000
+n.pc = 10
+df.scores = lapply(list.samples, function(x){
+  genes.topX = names(sort(apply(df.corrected[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.corrected[genes.topX[1:n.features], x]),
+    scale  = "uv",  
+    nPcs   = n.pc) %>%
+    scores %>%
+    data.frame %>%
+    tibble::rownames_to_column('sampleId')}) %>%
+  bind_rows(.id='subset') %>%
+  merge(df.meta, by='sampleId') %>%
+  mutate(treatment = 
+    factor(treatment, levels = names(list.treatment_colors))) %>%
+  mutate(tissue = gsub('RPE', 'Eye cup', tissue)) %>%
+  mutate(FLAG = sampleId %in% c('sample_12', 'sample_04')) %>%
+  data.table
+
+# R2 per subset
+df.r2 = lapply(list.samples, function(x){
+  genes.topX = names(sort(apply(df.corrected[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.corrected[genes.topX[1:n.features], x]),
+    scale  = "uv",  
+    nPcs   = n.pc) %>%
+    R2cum %>%
+    data.frame %>%
+    magrittr::set_colnames('R2cum') %>%
+    tibble::rownames_to_column('PC')}) %>%
+  bind_rows(.id='subset') %>%
+  mutate(PC = factor(PC, levels = paste0('PC', 1:n.pc))) %>%
+  mutate(tissue = 'Retina') %>%
+  data.table
+
+# plot PCA all
+plot.pca.all = ggplot(df.scores[subset == 'All samples'] %>%
+   mutate(tissue = factor(tissue, levels=c('Retina', 'Eye cup')))) +
+  aes(x=PC1, y=PC2, shape=tissue, color=treatment) +
+  geom_point() +
+  scale_color_manual(
+    labels = list.treatment_labels,
+    values = as.character(list.treatment_colors)) +
+  labs(shape = 'Tissue', color = 'Treatment') +
+  facet_wrap(~subset) +
+  theme(
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line")) +
+  geom_text(data=df.r2[subset == 'All samples'][PC == 'PC2'], 
+    aes(x=-40, y=19, label=sprintf('%.3f', R2cum)), 
+    color='black', hjust='left', size=2.5)
+
+# legend
+plot.pca.legend = ggpubr::get_legend(plot.pca.all)
+plot.pca.all = plot.pca.all + theme(legend.position = 'none')
+
+# plot PCA retina / RPE
+plot.pca.ret = ggplot(df.scores[subset == 'Retina']) +
+  aes(x=PC1, y=PC2, shape=tissue, color=treatment) +
+  geom_point() +
+  scale_color_manual(
+    labels = list.treatment_labels,
+    values = as.character(list.treatment_colors)) +
+  geom_text(data=df.r2[subset == 'Retina'][PC == 'PC2'], 
+    aes(x=60, y=-20, label=sprintf('%.3f', R2cum)), 
+    color='black', hjust='left', size=2.5) +
+  facet_grid(. ~ subset) +
+  theme(
+    text = element_text(size = 7),
+    legend.position = 'none')
+plot.pca.rpe = ggplot(df.scores[subset == 'Eye cup']) +
+  aes(x=PC1, y=PC2, color=treatment) +
+  geom_point(shape=17) +
+  scale_color_manual(
+    labels = list.treatment_labels,
+    values = as.character(list.treatment_colors)) +
+  geom_text(data=df.r2[subset == 'Eye cup'][PC == 'PC2'], 
+    aes(x=50, y=-25, label=sprintf('%.3f', R2cum)), 
+    color='black', hjust='left', size=2.5) +
+  facet_grid(. ~ subset) +
+  theme(
+    text = element_text(size = 7),
+    legend.position = 'none')
+
+# assemble & save
+plot.pca = 
+  plot_spacer() + plot_spacer() + plot.pca.legend + 
+  plot.pca.all + plot.pca.ret + plot.pca.rpe + 
+  plot_layout(nrow = 2)
+ggsave(plot.pca, file = './plots/pca.corrected.pdf',
+       width=190, height=100, units = 'mm')
+
+```
+
+# VEGF samples with angiogram score 1
+
+```{r, VEGF samples}
+
+plot.angio = df.plot.corrected %>%
+  dplyr::filter(treatment == 'AAVvegf_low') %>%
+  mutate(tissue = gsub('RPE', 'Eye cup', tissue)) %>%
+  mutate(tissue = factor(tissue, levels=c('Retina', 'Eye cup'))) %>%
+  ggplot() +
+  aes(x=as.factor(angiogram), y=hVEGF, shape=exclude_vegf) +
+  geom_point(color=list.treatment_colors$AAVvegf_low) +
+  geom_text_repel(aes(label = paste0('R', replicate)), 
+                  size=2.5, force=10, seed=2) +
+  facet_wrap(~tissue, ncol=1) +
+  labs(
+    title='hVEGF', 
+    x='Vascular phenotype severity', 
+    y='CPM [log2]', 
+    shape='Exclude') +
+  theme(
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line"))
+
+ggsave(plot.angio, file='./plots/plot.VEGF.pdf',
+       width=75, height=120, units='mm')
+
+df.sub = df.scores[subset != 'All samples'] %>%
+  mutate(subset = factor(subset, levels=c('Retina', 'Eye cup'))) %>%
+  mutate(tissue = factor(tissue, levels=c('Retina', 'Eye cup')))
+plot.pca.vegf = ggplot(df.sub) +
+  aes(x=PC1, y=PC2, shape=tissue, color=treatment) +
+  geom_point() +
+  scale_color_manual(
+    labels = list.treatment_labels,
+    values = as.character(list.treatment_colors)) +
+  geom_text_repel(
+    data = df.sub[treatment == 'AAVvegf_low'],
+    aes(label = paste0('R', replicate)), size=3) +
+  labs(shape = 'Tissue', color = 'Treatment') +
+  facet_wrap(~subset, ncol=1, scales='free') +
+  theme(
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line"))
+
+ggsave(plot.pca.vegf, file='./plots/plot.VEGF.pca.pdf',
+       width=100, height=120, units='mm')
+```
+
+# Differential gene expression (split by tissue)
+
+```{r, dge analysis}
+
+# metadata with row names
+df.tmp = df.meta %>%
+  #### remove VEGF samples wigh no phenotype #####
+  dplyr::filter(!exclude_vegf) %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleId')
+
+# DE analysis for each tissue
+df.DE = lapply(tissues, function(tissue){
+  # design
+  design = model.matrix(
+    ~0 + treatment, 
+    data = df.tmp[df.tmp$tissue == tissue, ]) %>%
+    magrittr::set_colnames(gsub('treatment', '', colnames(.)))
+  # contrasts
+  contr.matrix = makeContrasts(
+    low_vs_ctrl = AAVstuffer_low - none,
+    high_vs_ctrl = AAVstuffer_high - none,
+    high_vs_low = AAVstuffer_high - AAVstuffer_low,
+    IL6 = AAVil6_high - AAVstuffer_high,
+    TNFa = AAVtnfa_high - AAVstuffer_high,
+    VEGF = AAVvegf_low - AAVstuffer_low,
+    TNFa_vs_VEGF = AAVtnfa_high - AAVvegf_low,
+    IL6_vs_VEGF = AAVil6_high - AAVvegf_low,
+    IL6_vs_TNFa = AAVil6_high - AAVtnfa_high,
+    levels = colnames(design))
+  # limma
+  res.limma = df.corrected[, rownames(design)] %>%
+    lmFit(design=design) %>%
+    contrasts.fit(contrasts=contr.matrix) %>%
+    eBayes()
+  # topTreat
+  lapply(1:ncol(contr.matrix), function(index.contrast)
+    topTreat(res.limma, coef = index.contrast, n = Inf, adjust.method = 'BH') %>%
+      tibble::rownames_to_column('ensemblID') %>%
+      mutate(rank = 1:nrow(.)) %>%
+      mutate(contrast = colnames(contr.matrix)[index.contrast])) %>%
+    bind_rows() %>%
+    mutate(tissue = tissue)}) %>%
+  bind_rows() %>%
+  merge(gtf, by='ensemblID', all.x=T) %>%
+  mutate('sig' = adj.P.Val < 0.05) %>%
+  mutate('label' = rank <= 5) %>%
+  mutate(group = paste0(contrast, '_', tissue)) %>%
+  data.table
+
+# save
+fwrite(df.DE, './results/df.AAV_limma.csv', sep='\t')
+
+```
+
+# plots
+
+## p-value distribution
+
+```{r, pvalue distribution}
+
+# histogram plots
+df.DE %>%
+  dplyr::select(tissue, contrast, P.Value, adj.P.Val) %>%
+  gather(variable, value, -tissue, -contrast) %>%
+  ggplot() +
+  aes(x=value, fill=variable) + 
+  geom_histogram(position = 'identity', alpha = 0.3) +
+  facet_grid(tissue~contrast) +
+  labs(fill='') +
+  scale_fill_discrete(labels=c('P-Value', 'BH-adjusted P-Value')) 
+  
+```
+
+## volcano plots
+
+```{r, volcano plots}
+
+# volcano plots for different contrasts
+set.show = set2
+df.DE.sub = df.DE[contrast %in% set.show] %>%
+  mutate(tissue = gsub('RPE', 'Eye cup', tissue)) %>%
+  mutate(tissue = factor(tissue, levels=c('Retina', 'Eye cup')))
+ggplot(df.DE.sub) +
+  aes(x=logFC, y=-log10(adj.P.Val), color=sig) +
+  geom_point(size=0.5) +
+  geom_text_repel(
+    data = df.DE.sub[(label)], 
+    aes(label = geneID), color='black', size=2.5) +
+  facet_grid(factor(contrast, levels=set.show)~tissue) +
+  guides(color=guide_legend(title='Significant\n(BH-adjusted P-value < 0.05)')) +
+  theme(
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line"),
+    legend.position = 'top'
+  )
+
+# save
+ggsave(file = paste0('./plots/volcano.', 'set2', '.pdf'),
+       width=100, height=140, units='mm')
+
+```
+
+## barplot DE genes
+
+```{r, barplot  DE genes}
+
+list.contrast_include = c(
+  'low_vs_ctrl',
+  'high_vs_ctrl',
+  'VEGF',
+  'TNFa',
+  'IL6')
+
+list.contrast_labels = c(
+  'AAV-stuffer (low)\nvs.\nNon-injected',
+  'AAV-stuffer (high)\nvs.\nNon-injected',
+  'AAV-VEGF (low)\nvs.\nAAV-stuffer (low)',
+  'AAV-TNFa (high)\nvs.\nAAV-stuffer (high)',
+  'AAV-IL6 (high)\nvs.\nAAV-stuffer (high)')
+
+
+# barplot
+df.bar.DE = df.DE[contrast %in% list.contrast_include] %>%
+  dplyr::select(contrast, tissue, sig) %>%
+  table %>%
+  data.table %>%
+  dplyr::filter(sig == T) %>%
+  mutate(contrast = factor(contrast, levels=rev(list.contrast_include))) %>%
+  mutate(tissue = gsub('RPE', 'Eye cup', tissue)) %>%
+  mutate(tissue = factor(tissue, levels=c('Eye cup', 'Retina')))
+plot.bar.DE = ggplot(df.bar.DE) +
+  aes(y=contrast, x=N, fill=tissue) +
+  geom_bar(stat='identity', position=position_dodge(preserve = "single")) +
+  geom_text(aes(y=contrast, x=150, label=N), 
+            position = position_dodge(width = 0.9), size=2, hjust=0) +
+  guides(fill=guide_legend(title='Tissue')) +
+  xlab('# DE genes') +
+  scale_fill_manual(values = c('Eye cup'='#5b9bd5', Retina='#ed7d31'), drop=FALSE) +
+  scale_y_discrete(labels = rev(list.contrast_labels), drop=FALSE) +
+  theme(
+    text = element_text(size = 7),
+    legend.key.size=unit(0.5,"line"),
+    axis.text.y = element_text(hjust=0.5, vjust=0.4),
+    axis.text.x = element_text(angle=90, hjust=0.5, vjust=0.4),
+    axis.title.y = element_blank(),
+    legend.position = 'top'
+  )
+
+# save
+ggsave(plot.bar.DE, file = './plots/barplot.DE_genes.pdf',
+       width=50, height=75, units='mm')
+
+```
+
+## define genesets
+
+```{r, define genesets}
+
+# FIZME: hamornize geneset name (RPE, Retina)
+
+# DE genes to list
+list.DE = lapply(groups2, function(x)
+  df.DE[group == x][(sig)]$ensemblID) %>%
+  magrittr::set_names(paste0('set_', groups2))
+
+# union sets
+list.DE$union_all_retina = Reduce(
+  union, list.DE[c('set_IL6_Retina', 'set_TNFa_Retina', 'set_VEGF_Retina')])
+list.DE$union_all_rpe = Reduce(
+  union, list.DE[c('set_IL6_RPE', 'set_TNFa_RPE', 'set_VEGF_RPE')])
+
+# intersect sets all
+list.DE$intersect_all_retina = Reduce(
+  intersect, list.DE[c('set_IL6_Retina', 'set_TNFa_Retina', 'set_VEGF_Retina')])
+list.DE$intersect_all_rpe = Reduce(
+  intersect, list.DE[c('set_IL6_RPE', 'set_TNFa_RPE', 'set_VEGF_RPE')])
+
+# dual intersect sets
+list.DE$intersect_IL6_TNFa_retina = 
+  intersect(list.DE$set_IL6_Retina, list.DE$set_TNFa_Retina)
+list.DE$intersect_IL6_VEGF_retina = 
+  intersect(list.DE$set_IL6_Retina, list.DE$set_VEGF_Retina)
+list.DE$intersect_TNFa_VEGF_retina = 
+  intersect(list.DE$set_TNFa_Retina, list.DE$set_VEGF_Retina)
+list.DE$intersect_IL6_TNFa_rpe = 
+  intersect(list.DE$set_IL6_RPE, list.DE$set_TNFa_RPE)
+list.DE$intersect_IL6_VEGF_rpe = 
+  intersect(list.DE$set_IL6_RPE, list.DE$set_VEGF_RPE)
+list.DE$intersect_TNFa_VEGF_rpe = 
+  intersect(list.DE$set_TNFa_RPE, list.DE$set_VEGF_RPE)
+
+# unique genes
+list.DE$unique_IL6_retina = setdiff(
+  list.DE$set_IL6_Retina, union(list.DE$set_TNFa_Retina, list.DE$set_VEGF_Retina))
+list.DE$unique_TNFa_retina = setdiff(
+  list.DE$set_TNFa_Retina, union(list.DE$set_IL6_Retina, list.DE$set_VEGF_Retina))
+list.DE$unique_VEGF_retina =   setdiff(
+  list.DE$set_VEGF_Retina, union(list.DE$set_IL6_Retina, list.DE$set_TNFa_Retina))
+list.DE$unique_IL6_rpe =   setdiff(
+  list.DE$set_IL6_RPE, union(list.DE$set_TNFa_RPE, list.DE$set_VEGF_RPE))
+list.DE$unique_TNFa_rpe = setdiff(
+  list.DE$set_TNFa_RPE, union(list.DE$set_IL6_RPE, list.DE$set_VEGF_RPE))
+list.DE$unique_VEGF_rpe = setdiff(
+  list.DE$set_VEGF_RPE, union(list.DE$set_IL6_RPE, list.DE$set_TNFa_RPE))
+
+# stats on genesets
+df.sets.stats = data.table(
+  set.name = names(list.DE),
+  set.size = lapply(list.DE, length)) %>%
+  arrange(set.name)
+
+# DE list to dataframe
+df.DE.sets = lapply(names(list.DE), function(x)
+  data.table(
+    geneset = x,
+    ensemblID = list.DE[[x]]
+  )) %>%
+  bind_rows
+
+# save
+fwrite(df.DE.sets, './results/df.DE_sets.csv')
+
+```
+
+## venn diagrams and set overlap
+
+```{r, venn diagram}
+
+# venn diagrams
+sets.show = c('set_VEGF_Retina', 'set_TNFa_Retina', 'set_IL6_Retina')
+sets.show = c('set_VEGF_RPE', 'set_TNFa_RPE', 'set_IL6_RPE')
+library(ggvenn)
+list.DE[sets.show] %>%
+  magrittr::set_names(gsub('set_', '', names(.))) %>%
+  magrittr::set_names(gsub('_', ' ', names(.))) %>%
+  magrittr::set_names(gsub('RPE', 'Eye cup', names(.))) %>%
+  ggvenn(
+  fill_color = as.character(list.treatment_colors[4:6]),
+  stroke_size = 0.2, 
+  set_name_size = 2.5, 
+  show_percentage = F,
+  text_size = 2.5) +
+  theme(
+    text = element_text(size = 7)
+  )
+
+# save
+ggsave(file = './plots/venn.DE_Retina.pdf',
+       height=45, width=45, units='m')
+
+# set comparison
+source('/data/cb_projects/user/beckerko/workspace/Rscripts/nerdvana.R')
+res.comp = compareSets(list.DE, bkgSet = rownames(df.corrected))
+ggplot(res.comp$setTable[
+    Var1 %in% paste0('set_', groups2) & 
+    Var2 %in% paste0('set_', groups2)]) +
+  aes(x=Var1, y=Var2, fill=-log10(fdr + 1e-500)) +
+  geom_tile() +
+  geom_text(aes(label = observed), color='black') +
+  scale_fill_distiller(palette = "RdBu") +
+  theme(
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.4),
+    axis.title = element_blank())
+
+```
+
+# fold-change correlation
+
+```{r, fold-change correlation}
+
+df.FC = df.DE %>%
+  dplyr::select(ensemblID, group, logFC) %>%
+  tidyr::spread(group, logFC) %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+# heatmap AAV groups
+df.FC[, groups2] %>%
+  cor() %>%
+  magrittr::set_colnames(gsub('_', ' ', colnames(.))) %>%
+  magrittr::set_rownames(gsub('_', ' ', rownames(.))) %>%
+  magrittr::set_rownames(gsub('RPE', 'Eye cup', rownames(.))) %>%
+  magrittr::set_colnames(gsub('RPE', 'Eye cup', colnames(.))) %>%
+  pheatmap::pheatmap(
+    display_numbers = T,
+    fontsize = 7,
+    treeheight_row = 10,
+    treeheight_col = 10,
+    #filename = './plots/heatmap.FC_correlation.pdf',
+    width = 70 / 25.4,
+    height = 60 / 25.4)
+
+# scatter heatmap AAV groups
+library(GGally)
+ggpairs(df.FC[, groups1])
+ggpairs(df.FC[, groups2])
+
+```
+
+
+```{r, fold change scatter}
+
+# conditions to compare
+x = 'TNFa_Retina'
+y = 'IL6_Retina'
+
+# levels for plotting
+levels.sig = c(
+  'None',
+  setdiff(c(x, y), c('None', 'Both')),
+  'Both')
+
+# top genes to label
+n = 10
+top = lapply(c(x, y), function(z)
+  df.DE %>%
+    dplyr::filter(group %in% z) %>%
+    dplyr::arrange(-abs(logFC)) %>%
+    mutate(rank.FC = 1:nrow(.)) %>%
+    dplyr::filter(rank.FC <= n) %>%
+    .$ensemblID) %>%
+  magrittr::set_names(c('x', 'y'))
+
+# df for colors based on significance
+df.sig = df.DE %>%
+  dplyr::filter(group %in% c(x, y)) %>%
+  dplyr::filter(sig == T) %>%
+  dplyr::add_count(ensemblID) %>%
+  mutate(g = ifelse(n == 2, 'Both', group)) %>%
+  dplyr::select(ensemblID, g) %>%
+  unique
+
+# prep df for plotting
+df.scatter = df.DE %>%
+  dplyr::filter(group %in% c(x, y)) %>%
+  dplyr::select(ensemblID, group, geneID, logFC) %>%
+  tidyr::spread(group, logFC) %>%
+  # info on significance
+  merge(df.sig, by='ensemblID', all=T) %>%
+  mutate(g = ifelse(is.na(g), 'None', g)) %>%
+  mutate(g = factor(g, levels=levels.sig)) %>%
+  # which labels to plot
+  mutate(show = ensemblID %in% c(top$x, top$y)) %>%
+  arrange(g)
+
+# scatter plot
+ggplot(df.scatter) +
+  aes_string(x=x, y=y, color='g') +
+  geom_point(size=0.5) +
+  geom_text_repel(data = df.scatter[(show)],
+    aes(label = geneID), color='black', size=2.5) +
+  scale_color_manual(
+    labels = gsub('_', ' ', levels.sig),
+    values = c('gray', RColorBrewer::brewer.pal(3, 'Set2'))) +
+  labs(
+    x = paste0(gsub('_', ' ', x), ' [log2 FC]'), 
+    y = paste0(gsub('_', ' ', y), ' [log2 FC]')) +
+  guides(color=guide_legend(title='Significance')) +
+  theme(
+    text = element_text(size=7),    
+    legend.key.size=unit(0.5,"line"))
+
+ggsave(file = paste0('./plots/scatter.', x, '_vs_', y, '.pdf'),
+       width = 100, height=60, units='mm')
+
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,261 @@
+---
+title: "Cell Specific Expression & Deconvolution"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(tidyr)
+library(pcaMethods)
+library(limma)
+library(ggrepel)
+library(plyr)
+library(dplyr)
+
+source('./specs.R')
+
+```
+
+
+```{r, get custom gtf file}
+
+# ensemblID geneID mouse
+gtf = fread('./data/Mus_musculus.GRCm38.96_AAV.gtf', header = F, sep = "\t") %>%
+  dplyr::filter(V3 == "gene") %>%
+  mutate(geneID = gsub(".*gene_name .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(geneID = ifelse(substr(geneID, 1, 7) == 'gene_id', NA, geneID)) %>%
+  mutate(ensemblID = gsub(".*gene_id .(.*?).; .*", "\\1", V9, perl = T)) %>%
+  mutate(biotype = gsub(".*gene_biotype .(.*?).;", "\\1", V9, perl = T)) %>%
+  dplyr::select(geneID, ensemblID, biotype) %>%
+  data.table
+
+```
+
+# AAV models
+
+## load project data
+
+```{r, get expression data}
+
+# expression data
+df.corrected = data.table::fread('./data/AAV_logCPM_corrected.txt') %>%
+  tibble::column_to_rownames('ensembl_gene_id')
+
+# column data
+df.meta = fread('./data/AAV_meta.txt')
+
+# get limma table
+df.DE = fread('./results/df.AAV_limma.csv')
+
+# cell specific markers
+df.term2gene.celltypes = fread('./data/df.scRNA_cell_specific_markers.csv')
+
+```
+
+## cell specific expression AAV
+
+```{r, enrichment for markers}
+
+# sets to use for ORA
+sets.use = c('VEGF_Retina', 'TNFa_Retina', 'IL6_Retina', 'TNFa_RPE', 'IL6_RPE')
+
+# enrichment analysis markers
+df.ORA.celltypes = lapply(sets.use, function(x){
+  set.DE = df.DE[group == x][(sig), ensemblID]
+  clusterProfiler::enricher(
+    set.DE,
+    TERM2GENE = df.term2gene.celltypes,
+    universe = rownames(df.corrected),
+    minGSSize = 0,
+    maxGSSize = 10000,
+    pvalueCutoff = 1.1) %>%
+    .@result %>%
+    dplyr::select(-geneID, -Description) %>%
+    mutate(geneset = x) %>%
+    data.table}) %>%
+  bind_rows() %>%
+  mutate(significant = p.adjust < 0.05) %>%
+  mutate(dataset = sapply(strsplit(ID, '_'), '[', 1)) %>%
+  mutate(treatment = sapply(strsplit(geneset, '_'), '[', 1)) %>%
+  mutate(tissue = sapply(strsplit(geneset, '_'), '[', 2)) %>%
+  mutate(cellType = gsub('^(.*?)_', '', ID)) %>%
+  mutate(plot.group = paste0(dataset, ' / ', tissue))
+
+```
+
+```{r, bar plot enrichment}
+
+# what to plot
+lvls.treatment = c('VEGF', 'TNFa', 'IL6')
+group.show = c(
+  'VoigtRPE / RPE',
+  'HengRetina / Retina')
+
+group.show = c(
+  'VoigtRetina / Retina')
+
+df.ORA.celltypes %>%
+  dplyr::filter(plot.group %in% group.show) %>%
+  mutate(treatment = factor(treatment, levels = lvls.treatment)) %>%
+  mutate(plot.group = gsub(' RPE', ' Eye cup', plot.group)) %>%
+ggplot() +
+  aes(x=cellType, y=-log10(p.adjust), fill=treatment) +
+  geom_hline(yintercept = -log10(0.05), linetype='dashed') +
+  geom_bar(stat='identity', position=position_dodge(preserve = "single")) +
+  scale_fill_manual(
+    values = as.character(list.treatment_colors[4:6])) +
+  labs(y = 'BH-adjusted P-Value [-log10]', fill='') +
+  scale_x_discrete(label = function(x)
+    gsub('_', ' ', x, 50)) +
+  facet_wrap(~plot.group, ncol=2, scale='free') +
+  theme(
+    text = element_text(size=7),
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1),
+    axis.title.x = element_blank(),
+    legend.key.size=unit(0.5,"line"),
+    legend.position = 'right')
+  
+ggsave(paste0('./plots/barplot.celltypeEnrichment.unique.main.pdf'),
+              width=170, height=70, units='mm')
+
+# main: w170
+# supp: w90
+
+```
+
+# cell specific expression OIR
+
+```{r, cell specific expression OIR}
+
+# get OIR DE data
+df.DE.oir = fread('./results/proj394_limma.csv')
+
+# main contrasts
+list.oir = paste0('P', 12:16)
+
+# enrichment analysis markers
+df.ORA.celltypes.oir = lapply(list.oir, function(x){
+  set.DE = df.DE.oir[contrast == x][(sig), ensemblID]
+  clusterProfiler::enricher(
+    set.DE,
+    TERM2GENE = df.term2gene.celltypes,
+    universe = rownames(df.DE.oir$ensemblID %>% unique),
+    minGSSize = 0,
+    maxGSSize = 10000,
+    pvalueCutoff = 1.1) %>%
+    .@result %>%
+    dplyr::select(-geneID, -Description) %>%
+    mutate(geneset = x) %>%
+    data.table}) %>%
+  bind_rows() %>%
+  mutate(significant = p.adjust < 0.05) %>%
+  mutate(dataset = sapply(strsplit(ID, '_'), '[', 1)) %>%
+  #mutate(treatment = sapply(strsplit(geneset, '_'), '[', 1)) %>%
+  #mutate(tissue = sapply(strsplit(geneset, '_'), '[', 2)) %>%
+  mutate(cellType = gsub('^(.*?)_', '', ID))
+  #mutate(plot.group = paste0(dataset, ' / ', tissue))
+
+ggplot(df.ORA.celltypes.oir %>%
+         dplyr::filter(dataset != 'VoigtRPE')) +
+  aes(x=cellType, y=-log10(p.adjust), fill=geneset) +
+  geom_bar(stat='identity', position='dodge') +
+  geom_hline(yintercept = -log10(0.05), linetype='dashed') +
+  facet_wrap(~dataset, scale='free_x') +
+  theme(
+    text = element_text(size=7),
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1),
+    axis.title.x = element_blank(),
+    legend.key.size=unit(0.5,"line"),
+    legend.position = 'right')
+
+ggsave(filename = './plots/barplot.celltypeEnrichment.oir.pdf',
+       height=85, width=160, units='mm')
+
+```
+
+```{r, fold-change heatmap}
+
+# fold changes oir
+df.FC.oir = df.DE.oir %>%
+  dplyr::select(ensemblID, contrast, logFC) %>%
+  tidyr::spread(contrast, logFC) %>%
+  data.frame %>%
+  tibble::column_to_rownames('ensemblID')
+
+
+set.show = c('VoigtRetina_Endothelial_Cells')
+#set.show = c('HengRetina_Vascular endothelial cells')
+#set.show = c('HengRetina_T cells')
+groups.show = list.oir
+
+# genes to show
+genes.show = df.term2gene.celltypes %>%
+  dplyr::filter(set == set.show) %>%
+  dplyr::filter(ensemblID %in% df.DE.oir[contrast %in% groups.show][(sig)]$ensemblID) %>%
+  .$ensemblID
+
+# annotation for heatmap
+df.anno = df.DE %>%
+  dplyr::filter(group %in% groups.show) %>%
+  dplyr::filter(ensemblID %in% genes.show) %>%
+  dplyr::select(geneID, group, sig) %>%
+  mutate(sig = ifelse(sig, 't', 'f')) %>%
+  tidyr::spread(group, sig) %>%
+  tibble::column_to_rownames('geneID')
+
+# anno colors
+ann_colors = list(
+  VEGF_Retina=c(f='#FFFFFF', t=list.treatment_colors[[4]]),
+  VEGF_RPE=c(f='#FFFFFF', t=list.treatment_colors[[4]]),
+  TNFa_Retina=c(f='#FFFFFF', t=list.treatment_colors[[5]]),
+  TNFa_RPE=c(f='#FFFFFF', t=list.treatment_colors[[5]]),
+  IL6_Retina=c(f='#FFFFFF', t=list.treatment_colors[[6]]),
+  IL6_RPE=c(f='#FFFFFF', t=list.treatment_colors[[6]])) %>%
+  magrittr::set_names(gsub('_', ' ', names(.)))
+
+# heatmap colors
+my.breaks <- seq(-2, 2, by=0.1) 
+my.colors <- colorRampPalette(rev(brewer.pal(n = 7, name =
+  "RdBu")))(length(my.breaks))
+
+pheatmap::pheatmap(
+  df.FC.oir[genes.show, groups.show] %>%
+    magrittr::set_rownames(gtf[match(genes.show, ensemblID), geneID]) %>% t,
+  show_colnames = T,
+  #annotation_row = df.anno %>%
+  #  magrittr::set_colnames(gsub('_', ' ', colnames(.))) %>%
+  #  .[, gsub('_', ' ', rev(groups.show))],
+  cluster_rows = F, 
+  annotation_legend = FALSE,
+  #annotation_colors = ann_colors,
+  color=my.colors,
+  breaks=my.breaks,
+  #treeheight_row = 15,
+  #treeheight_col = 10,
+  fontsize = 7,
+  main = set.show,
+  #filename = paste0('./plots/heatmap.', set.show,'.pdf'),
+  width = 50 / 25.4,
+  height = 100 / 25.4)
+
+# HengRetina_T cells w:50, h:100
+
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
