@@ -1,0 +1,505 @@
+---
+title: "QC, filtering, correction"
+author: "Kolja Becker"
+date: 
+output:
+  html_document:
+    toc: TRUE
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r, setup}
+
+library(data.table)
+library(pcaMethods)
+library(limma)
+library(ggplot2)
+library(tidyr)
+library(plyr)
+library(dplyr)
+
+```
+
+# AAV project data
+
+```{r, get data}
+
+# counts data
+df.counts = data.table::fread('./data/AAV_counts.txt') %>%
+  tibble::column_to_rownames('ensembl_gene_id')
+
+# column data
+df.meta = fread('./data/AAV_meta.txt')
+
+```
+
+# QC data
+
+```{r, multiQC metrics}
+
+# multiQC path
+dir.multiqc = './data/multiqc/'
+
+# star
+df.star = fread(paste0(dir.multiqc, 'multiqc_star.txt')) %>%
+  mutate(sampleId = gsub('1073_0', 'AAV_', Sample)) %>%
+  mutate(sampleId = gsub('_star.*', '', sampleId)) %>%
+  dplyr::select(-Sample)
+
+# picard metrics
+df.picard = fread(paste0(dir.multiqc, 'multiqc_picard_RnaSeqMetrics.txt')) %>%
+  mutate(sampleId = gsub('1073_0', 'AAV_', Sample)) %>%
+  mutate(sampleId = gsub('_star.*', '', sampleId)) %>%
+  dplyr::select(-Sample)
+
+# featurecounts
+df.featurecounts = fread(paste0(dir.multiqc, 'multiqc_featureCounts.txt')) %>%
+  mutate(sampleId = gsub('1073_0', 'AAV_', Sample)) %>%
+  mutate(sampleId = gsub('_star.*', '', sampleId)) %>%
+  dplyr::select(-Sample)
+
+# collate and filter
+df.metrics = df.featurecounts %>%
+  merge(df.star, by='sampleId') %>%
+  merge(df.picard, by='sampleId') %>%
+  dplyr::select(sampleId, names(which(apply(., 2, var) != 0))) %>%
+  merge(df.meta, by='sampleId')
+
+```
+
+## plot uniquely mapped
+
+```{r, check for multimap issues}
+
+ggplot(df.metrics) +
+  aes(x=sampleId, y=uniquely_mapped_percent, fill=treatment) +
+  geom_bar(stat='identity') +
+  theme(axis.text.x = element_blank())
+
+```
+
+## plot reads per sample
+
+```{r, reads per sample}
+
+# collect num reads
+df.reads = data.table(
+  sampleId = colnames(df.counts),
+  num.reads = colSums(df.counts)) %>%
+  merge(df.meta, by='sampleId')
+
+# barplot
+ggplot(df.reads) +
+  aes(x=sampleId, y=num.reads, fill=tissue) +
+  geom_bar(stat='identity') +
+  theme(
+    axis.text.x = element_blank()
+  )
+
+```
+
+# Filter genes
+
+```{r, display counts distribution}
+
+# threshold
+thr.counts = 10
+
+# density plot
+df.counts %>%
+  data.table %>%
+  tidyr::gather(sampleId, counts) %>%
+  ggplot() +
+    aes(x=log10(counts), fill=sampleId) +
+    geom_density(alpha=0.01) +
+    geom_vline(xintercept = log10(thr.counts), linetype='dashed') +
+    theme(
+      legend.position = 'none')
+
+# filter
+df.counts.filtered = df.counts[apply(df.counts, 1, max) >= thr.counts, ]
+
+```
+
+# Normalization
+
+```{r, voom}
+
+# normalization
+df.voom = df.counts.filtered %>%
+  edgeR::DGEList() %>%
+  edgeR::calcNormFactors() %>%
+  limma::voom()
+
+```
+
+# PCA plots uncorrected data
+
+## PCA on raw data
+
+```{r, pca on raw data}
+
+# split data by tissue
+list.samples = list()
+list.samples$all = df.meta$sampleId
+list.samples$ret = df.meta[tissue == 'Retina']$sampleId
+list.samples$rpe = df.meta[tissue != 'Retina']$sampleId
+
+# PCA per subset
+n.features = 1000
+n.pc = 10
+df.scores = lapply(list.samples, function(x){
+  genes.topX = names(sort(apply(df.voom$E[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.voom$E[genes.topX[1:n.features], x]),
+    scale  = "uv",  
+    nPcs   = n.pc) %>%
+    scores %>%
+    data.frame %>%
+    tibble::rownames_to_column('sampleId')}) %>%
+  bind_rows(.id='subset') %>%
+  merge(df.metrics, by='sampleId') %>%
+  data.table
+
+# plot PCA
+ggplot(df.scores) +
+  aes(x=PC1, y=PC2, shape=tissue, color=exclude_vegf) +
+  geom_point() +
+  facet_wrap(~subset, ncol=2, scales='free')
+
+# cum r2
+df.r2 = lapply(list.samples, function(x){
+  genes.topX = names(sort(apply(df.voom$E[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.voom$E[genes.topX[1:n.features], x]),
+    scale  = "uv",  
+    nPcs   = n.pc) %>%
+    R2cum %>%
+    data.frame %>%
+    magrittr::set_colnames('R2cum') %>%
+    tibble::rownames_to_column('PC')}) %>%
+  bind_rows(.id='subset') %>%
+  mutate(PC = factor(PC, levels = paste0('PC', 1:n.pc))) %>%
+  data.table
+
+# plot cumulative R2
+ggplot(df.r2) +
+  aes(x=PC, y=R2cum) +
+  geom_bar(stat='identity') +
+  facet_wrap(~subset, ncol=1) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+
+```
+
+
+## PCA per treatment
+
+```{r, pca per treatment group}
+
+# separate treaments groups and tissues
+treatment.groups = df.meta$MFGroup %>% unique
+df.scores.2 = lapply(treatment.groups, function(x){
+  samples = df.meta[MFGroup == x]$sampleId
+  genes.topX = names(sort(apply(df.voom$E[, samples], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.voom$E[genes.topX[1:n.features], samples]),
+    scale  = "uv",  
+    nPcs   = 2) %>%
+    scores %>%
+    data.frame %>%
+    tibble::rownames_to_column('sampleId') %>%
+  mutate(treatment.group = x)}) %>%
+  bind_rows() %>%
+  merge(df.meta, by='sampleId') %>%
+  data.table
+
+# plot rna extraction batch
+ggplot(df.scores.2) +
+  aes(x=PC1, y=PC2, color=as.factor(rna_extraction_batch)) +
+  geom_point() +
+  facet_wrap(~treatment.group)
+
+# plot angiogram
+ggplot(df.scores.2) +
+  aes(x=PC1, y=PC2, color=as.factor(angiogram)) +
+  geom_point() +
+  facet_wrap(~treatment.group)
+
+
+```
+
+## PCA controls only
+
+```{r, PCA controls only}
+
+# subset metadata for controls
+df.meta.controls = df.meta %>% 
+  dplyr::filter(treatment %in% c(
+    'none', 'AAVstuffer_low', 'AAVstuffer_high')) %>%
+  data.table
+
+# all, retina, RPE
+list.controls = list()
+list.controls$all = df.meta.controls$sampleId
+list.controls$rpe = df.meta.controls[tissue == 'RPE']$sampleId
+list.controls$ret = df.meta.controls[tissue != 'RPE']$sampleId
+
+# PCA per subset
+df.scores.controls = lapply(list.controls, function(x){
+  genes.topX = names(sort(apply(df.voom$E[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.voom$E[genes.topX[1:n.features], x]),
+    scale  = "uv",  
+    nPcs   = n.pc) %>%
+    scores %>%
+    data.frame %>%
+    tibble::rownames_to_column('sampleId')}) %>%
+  bind_rows(.id='subset') %>%
+  merge(df.meta.controls, by='sampleId') %>%
+  data.table
+
+# plot PCA
+ggplot(df.scores.controls) +
+  aes(x=PC1, y=PC2, shape=tissue, color=as.factor(rna_extraction_batch)) +
+  geom_point() +
+  facet_wrap(~subset, ncol=2, scales='free')
+
+```
+
+# Quality Controls
+
+## check numeric confounders
+
+```{r, check correlation of numeric features}
+
+# list of numeric features
+list.numeric = c(
+  'sampleId', 
+  paste0('PC', 1:n.pc),
+  'animal_id',     # negative control
+  'volume_.ul.',
+  'amount_.ng.',           # possible confounder with tissue  
+  'concentration_.ng.ul.', # possible confounder with tissue
+  'retina_thickness',
+  'weight_.g.',
+  'quant_.ng.ul.',
+  'rin',
+  'library_quant_.nm.',
+  'library_size_.bp.',
+  setdiff(colnames(df.metrics), colnames(df.meta)))
+
+# correlation
+list.cor = lapply(names(list.samples), function(x)
+  df.scores %>%
+    dplyr::filter(subset == x) %>%
+    dplyr::select(all_of(list.numeric)) %>%
+    dplyr::filter(!is.na(retina_thickness)) %>%
+    dplyr::filter(!is.na(library_size_.bp.)) %>%
+    dplyr::select(-sampleId) %>%
+    apply(2, as.numeric) %>%
+    data.frame %>%
+    cor(method = 'spearman')) %>%
+  magrittr::set_names(names(list.samples))
+
+# heatmap all samples
+pheatmap::pheatmap(
+  list.cor$all,
+  fontsize = 6.5)
+
+# heatmap ret, rpe
+cols = setdiff(colnames(list.cor$all), 'volume_.ul.')
+pheatmap::pheatmap(
+  list.cor$ret[cols, cols],
+  fontsize = 6.5)
+pheatmap::pheatmap(
+  list.cor$rpe[cols, cols],
+  fontsize = 6.5)
+
+# melt
+df.cor.melt = list.cor$rpe %>%
+  data.frame %>%
+  tibble::rownames_to_column('feature1') %>%
+  gather(feature2, cor, -feature1) %>%
+  dplyr::filter(feature1 != feature2) %>%
+  dplyr::filter(feature1 %in% paste0('PC', 1:n.pc)) %>%
+  arrange(-abs(cor)) %>%
+  data.table
+
+```
+
+## check for categorical confounders (batch effects)
+
+```{r, categorical confounders}
+
+# list of categorical features
+list.cat = c(
+  'animal_id',     # negative control
+  'treatment',
+  'eye',
+  'mouse_cage_number',
+  'cage_lot',
+  'rna_extraction_batch')
+
+# anova wrapper
+library(parallel)
+anovaSingle = function(df.y, df.x, categorical, n.cores=20){
+  df.y[, categorical] = as.character(df.y[, categorical])
+  # combine response and predictors
+  df.combined = cbind(df.y[, categorical, drop=F], df.x[rownames(df.y), ]) 
+  mclapply(colnames(df.combined)[2:ncol(df.combined)], function(f){
+    aov(as.formula(paste0(f, '~', categorical)), data=df.combined) %>%
+      summary %>%
+      unlist %>%
+      .['Pr(>F)1']
+  }, mc.cores=n.cores) %>%
+    unlist %>%
+    data.table %>%
+    magrittr::set_names('pvalue') %>%
+    mutate(predictor = colnames(df.combined)[2:ncol(df.combined)]) %>%
+    mutate(fdr = p.adjust(pvalue, method='BH')) %>%
+    dplyr::select(predictor, pvalue, fdr) %>%
+    data.table}
+
+# df with categorical values
+df.cat = df.meta %>%
+  dplyr::select(sampleId, all_of(list.cat)) %>%
+  data.frame %>%
+  tibble::column_to_rownames('sampleId')
+
+# anova tests
+df.anova = 
+  lapply(names(list.samples), function(a)
+    lapply(list.cat, function(x)
+      anovaSingle(
+        df.y = df.cat,
+        df.x = df.scores %>%
+          dplyr::filter(subset == a) %>%
+          dplyr::select(sampleId, paste0('PC', 1:n.pc)) %>%
+          data.frame %>%
+          tibble::column_to_rownames('sampleId'),
+        categorical = x) %>% 
+        mutate(response = x)
+      ) %>%
+    bind_rows() %>%
+    mutate(subset = a)) %>%
+  bind_rows()
+
+# plot associations
+# - all, PC1, volume
+ggplot(df.scores[subset == 'ret']) +
+  aes(x=treatment, fill=treatment, y=PC1) +
+  geom_violin() +
+  geom_jitter() +
+  theme(
+    #legend.position = 'none',
+    axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+
+```
+
+# Batch correction
+
+```{r, correction for rna batch within each tissue}
+
+# correct batch effects via combat
+df.corrected = lapply(list.samples[c('ret', 'rpe')], function(x)
+  sva::ComBat(
+    df.voom$E[, x],
+    df.meta[match(x, sampleId), rna_extraction_batch]) %>%
+  data.frame
+  ) %>%
+  bind_cols()
+
+```
+
+
+# PCA after correction
+
+```{r, pca on corrected data}
+
+# scores of corrected data
+df.scores.corrected = lapply(list.samples, function(x){
+  genes.topX = names(sort(apply(df.corrected[, x], 1, var), decreasing = TRUE))
+  pca(
+    object = t(df.corrected[genes.topX[1:n.features], x]),
+    scale  = "uv",  
+    nPcs   = n.pc) %>%
+    scores %>%
+    data.frame %>%
+    tibble::rownames_to_column('sampleId')}) %>%
+  bind_rows(.id='subset') %>%
+  merge(df.metrics, by='sampleId') %>%
+  data.table
+
+# plot PCA
+ggplot(df.scores.corrected) +
+  aes(x=PC1, y=PC4, shape=tissue, color=as.factor(rna_extraction_batch)) +
+  geom_point() +
+  facet_wrap(~subset, ncol=2, scales='free')
+
+```
+
+```{r, heatmaps correlation with pc metrics after correction}
+
+# PC vs metrics correlation after correction
+list.cor.corrected = lapply(names(list.samples), function(x)
+  df.scores.corrected %>%
+    dplyr::filter(subset == x) %>%
+    dplyr::select(all_of(list.numeric)) %>%
+    dplyr::filter(!is.na(retina_thickness)) %>%
+    dplyr::filter(!is.na(library_size_.bp.)) %>%
+    dplyr::select(-sampleId) %>%
+    apply(2, as.numeric) %>%
+    data.frame %>%
+    cor(method = 'spearman')) %>%
+  magrittr::set_names(names(list.samples))
+
+# heatmap all samples
+pheatmap::pheatmap(
+  list.cor.corrected$all,
+  fontsize = 6.5)
+
+# heatmap ret, rpe
+cols = setdiff(colnames(list.cor$all), 'volume_.ul.')
+pheatmap::pheatmap(
+  list.cor$ret[cols, cols],
+  fontsize = 6.5)
+pheatmap::pheatmap(
+  list.cor$rpe[cols, cols],
+  fontsize = 6.5)
+
+# melt and select features to correct for
+df.cor.melt.corrected = list.cor$rpe %>%
+  data.frame %>%
+  tibble::rownames_to_column('feature1') %>%
+  gather(feature2, cor, -feature1) %>%
+  dplyr::filter(feature1 != feature2) %>%
+  dplyr::filter(feature1 %in% paste0('PC', 1:n.pc)) %>%
+  arrange(-abs(cor)) %>%
+  data.table
+
+```
+
+# Save corrected data
+
+```{r, save data}
+
+# write counts table to submit_geo
+df.corrected %>% 
+  data.frame %>%
+  tibble::rownames_to_column('ensembl_gene_id') %>%
+  fwrite('./data/AAV_logCPM_corrected.txt')
+
+```
+
+# Reproducibility
+
+```{r}
+date()
+```
+
+```{r}
+sessionInfo()
+```
